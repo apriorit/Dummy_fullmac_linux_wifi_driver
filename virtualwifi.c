@@ -1,9 +1,10 @@
 #include <linux/module.h>
 
-#include <net/cfg80211.h> // wiphy
-#include <linux/skbuff.h> // skb
+#include <net/cfg80211.h> /* wiphy and probably everything that would required for FullMAC driver */
+#include <linux/skbuff.h>
 
-#include <linux/workqueue.h> // work_struct
+#include <linux/workqueue.h> /* work_struct */
+#include <linux/semaphore.h>
 
 #define WIPHY_NAME "navifly"
 #define NDEV_NAME "navifly%d"
@@ -15,6 +16,7 @@ struct navifly_context {
     struct net_device *ndev;
 
     /* DEMO */
+    struct semaphore sem;
     struct work_struct ws_connect;
     char connecting_ssid[sizeof(SSID_DUMMY)];
     struct work_struct ws_disconnect;
@@ -82,10 +84,16 @@ static void navifly_scan_routine(struct work_struct *w) {
     /* inform with dummy BSS */
     inform_dummy_bss(navi);
 
+    if(down_interruptible(&navi->sem)) {
+        return;
+    }
+
     /* finish scan */
     cfg80211_scan_done(navi->scan_request, &info);
 
     navi->scan_request = NULL;
+
+    up(&navi->sem);
 }
 
 /* It just checks SSID of the ESS to connect and informs the kernel that connect is finished.
@@ -94,6 +102,10 @@ static void navifly_scan_routine(struct work_struct *w) {
  * This routine called through workqueue, when the kernel asks about connect through cfg80211_ops. */
 static void navifly_connect_routine(struct work_struct *w) {
     struct navifly_context *navi = container_of(w, struct navifly_context, ws_connect);
+
+    if(down_interruptible(&navi->sem)) {
+        return;
+    }
 
     if (memcmp(navi->connecting_ssid, SSID_DUMMY, sizeof(SSID_DUMMY)) != 0) {
         cfg80211_connect_timeout(navi->ndev, NULL, NULL, 0, GFP_KERNEL, NL80211_TIMEOUT_SCAN);
@@ -107,6 +119,8 @@ static void navifly_connect_routine(struct work_struct *w) {
                              NL80211_TIMEOUT_UNSPECIFIED);
     }
     navi->connecting_ssid[0] = 0;
+
+    up(&navi->sem);
 }
 
 /* Just calls cfg80211_disconnected() that informs the kernel that disconnect is complete.
@@ -116,8 +130,15 @@ static void navifly_disconnect_routine(struct work_struct *w) {
 
     struct navifly_context *navi = container_of(w, struct navifly_context, ws_disconnect);
 
+    if(down_interruptible(&navi->sem)) {
+        return;
+    }
+
     cfg80211_disconnected(navi->ndev, navi->disconnect_reason_code, NULL, 0, true, GFP_KERNEL);
+
     navi->disconnect_reason_code = 0;
+    
+    up(&navi->sem);
 }
 
 /* callback that called by the kernel when user decided to scan.
@@ -126,13 +147,22 @@ static void navifly_disconnect_routine(struct work_struct *w) {
 static int nvf_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request) {
     struct navifly_context *navi = wiphy_get_navi_context(wiphy)->navi;
 
+    if(down_interruptible(&navi->sem)) {
+        return -ERESTARTSYS;
+    }
+
     if (navi->scan_request != NULL) {
+        up(&navi->sem);
         return -EBUSY;
     }
     navi->scan_request = request;
+
+    up(&navi->sem);
+
     if (!schedule_work(&navi->ws_scan)) {
         return -EBUSY;
     }
+
     return 0; /* OK */
 }
 
@@ -144,8 +174,14 @@ static int nvf_connect(struct wiphy *wiphy, struct net_device *dev,
     struct navifly_context *navi = wiphy_get_navi_context(wiphy)->navi;
     size_t ssid_len = sme->ssid_len > 15 ? 15 : sme->ssid_len;
 
+    if(down_interruptible(&navi->sem)) {
+        return -ERESTARTSYS;
+    }
+
     memcpy(navi->connecting_ssid, sme->ssid, ssid_len);
     navi->connecting_ssid[ssid_len] = 0;
+
+    up(&navi->sem);
 
     if (!schedule_work(&navi->ws_connect)) {
         return -EBUSY;
@@ -158,6 +194,15 @@ static int nvf_connect(struct wiphy *wiphy, struct net_device *dev,
 static int nvf_disconnect(struct wiphy *wiphy, struct net_device *dev,
                    u16 reason_code) {
     struct navifly_context *navi = wiphy_get_navi_context(wiphy)->navi;
+
+    if(down_interruptible(&navi->sem)) {
+        return -ERESTARTSYS;
+    }
+
+    navi->disconnect_reason_code = reason_code;
+
+    up(&navi->sem);
+
     if (!schedule_work(&navi->ws_disconnect)) {
         return -EBUSY;
     }
@@ -349,6 +394,7 @@ static int __init virtual_wifi_init(void) {
 
     if (g_ctx != NULL) {
         /*DEMO*/
+        sema_init(&g_ctx->sem, 1);
         INIT_WORK(&g_ctx->ws_connect, navifly_connect_routine);
         g_ctx->connecting_ssid[0] = 0;
         INIT_WORK(&g_ctx->ws_disconnect, navifly_disconnect_routine);
@@ -360,6 +406,11 @@ static int __init virtual_wifi_init(void) {
 }
 
 static void __exit virtual_wifi_exit(void) {
+    /* make sure that no work is queued */
+    cancel_work_sync(&g_ctx->ws_connect);
+    cancel_work_sync(&g_ctx->ws_disconnect);
+    cancel_work_sync(&g_ctx->ws_scan);
+
     navifly_free(g_ctx);
 }
 

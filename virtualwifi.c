@@ -110,13 +110,9 @@ static void navifly_connect_routine(struct work_struct *w) {
     if (memcmp(navi->connecting_ssid, SSID_DUMMY, sizeof(SSID_DUMMY)) != 0) {
         cfg80211_connect_timeout(navi->ndev, NULL, NULL, 0, GFP_KERNEL, NL80211_TIMEOUT_SCAN);
     } else {
-        /* we can connect to ESS that already know. If else, technically kernel will only warn.*/
-        /* so, lets send dummy bss to the kernel before complete. */
-        inform_dummy_bss(navi);
-
         /* also its possible to use cfg80211_connect_result() or cfg80211_connect_done() */
-        cfg80211_connect_bss(navi->ndev, NULL, NULL, NULL, 0, NULL, 0, WLAN_STATUS_SUCCESS, GFP_KERNEL,
-                             NL80211_TIMEOUT_UNSPECIFIED);
+        cfg80211_connect_result(navi->ndev, NULL, NULL, 0, NULL, 0,
+                                WLAN_STATUS_SUCCESS, GFP_KERNEL);
     }
     navi->connecting_ssid[0] = 0;
 
